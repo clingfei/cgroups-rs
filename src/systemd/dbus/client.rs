@@ -452,12 +452,23 @@ pub mod tests {
     fn test_freeze_and_thaw() {
         skip_if_no_systemd!();
 
+        let v2 = hierarchies::is_cgroup2_unified_mode();
         let unit = test_unit();
         let mut child = spawn_yes();
         let cgroup = start_default_cgroup(CgroupPid::from(child.id() as u64), &unit);
 
         // Freeze the unit
-        cgroup.freeze().unwrap();
+        let freeze_result = cgroup.freeze();
+        if !v2 {
+            assert!(
+                freeze_result.is_err(),
+                "systemd should reject FreezeUnit on cgroup v1"
+            );
+            stop_cgroup(&cgroup);
+            child.wait().unwrap();
+            return;
+        }
+        freeze_result.unwrap();
 
         let pid = child.id() as u64;
 
@@ -507,6 +518,7 @@ pub mod tests {
     fn test_add_process() {
         skip_if_no_systemd!();
 
+        let v2 = hierarchies::is_cgroup2_unified_mode();
         let unit = test_unit();
         let mut child = spawn_sleep_inf();
         let cgroup = start_default_cgroup(CgroupPid::from(child.id() as u64), &unit);
@@ -515,11 +527,15 @@ pub mod tests {
         let pid1 = CgroupPid::from(child1.id() as u64);
         cgroup.add_process(pid1, "/").unwrap();
 
-        let cgroup_procs_path = format!(
-            "/sys/fs/cgroup/{}/{}/cgroup.procs",
-            expand_slice(TEST_SLICE).unwrap(),
-            unit
-        );
+        let cgroup_root = if v2 {
+            Path::new("/sys/fs/cgroup")
+        } else {
+            Path::new("/sys/fs/cgroup/memory")
+        };
+        let cgroup_procs_path = cgroup_root
+            .join(expand_slice(TEST_SLICE).unwrap())
+            .join(&unit)
+            .join("cgroup.procs");
         for i in 0..5 {
             let content = fs::read_to_string(&cgroup_procs_path);
             if let Ok(content) = content {

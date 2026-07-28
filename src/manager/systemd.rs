@@ -370,6 +370,20 @@ mod tests {
         SystemdManager::new(&format!("{}:{}:{}", slice, scope_prefix, name)).unwrap()
     }
 
+    fn managed_cgroup_path(manager: &SystemdManager<'_>, subsystem: Option<&str>) -> String {
+        if manager.v2() {
+            return manager.cgroup_path(None).unwrap();
+        }
+
+        let subsystem = subsystem.expect("cgroup v1 requires a subsystem");
+        let mountpoint = manager
+            .mounts()
+            .get(subsystem)
+            .expect("cgroup v1 subsystem mountpoint should exist");
+        let slice_base = expand_slice(manager.slice()).unwrap();
+        join_path(mountpoint, &join_path(&slice_base, manager.unit()))
+    }
+
     fn run_set_resources_failed(resources: LinuxResources) {
         let mut child = spawn_sleep_inf();
         let mut manager = new_systemd_manager();
@@ -431,7 +445,7 @@ mod tests {
         let mut manager =
             SystemdManager::new(&format!("{}:{}:{}", slice, scope_prefix, name)).unwrap();
 
-        let cgroup_path = manager.cgroup_path(Some("memory")).unwrap();
+        let cgroup_path = managed_cgroup_path(&manager, (!manager.v2()).then_some("memory"));
         // Before starting the unit, no cgroup should exist.
         assert!(!Path::new(&cgroup_path).exists());
 

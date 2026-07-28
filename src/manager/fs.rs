@@ -1167,6 +1167,19 @@ mod tests {
         FsManager::new(TEST_BASE).unwrap()
     }
 
+    fn managed_cgroup_path(manager: &FsManager, subsystem: Option<&str>) -> String {
+        if manager.v2() {
+            return join_path(UNIFIED_MOUNTPOINT, &manager.base);
+        }
+
+        let subsystem = subsystem.expect("cgroup v1 requires a subsystem");
+        let mountpoint = manager
+            .mounts
+            .get(subsystem)
+            .expect("cgroup v1 subsystem mountpoint should exist");
+        join_path(mountpoint, &manager.base)
+    }
+
     fn run_set_resources_failed(resources: LinuxResources) {
         let mut child = spawn_sleep_inf();
         let mut manager = new_manager();
@@ -1218,14 +1231,8 @@ mod tests {
         let mut manager = new_manager();
 
         for (subsystem, mountpoint) in manager.mounts() {
-            let subsys = if subsystem.is_empty() {
-                assert!(manager.v2());
-                None
-            } else {
-                Some(subsystem.as_str())
-            };
-            let path = manager.cgroup_path(subsys).unwrap();
-            let path = join_path(mountpoint, &path);
+            let path = manager.paths().get(subsystem).unwrap();
+            let path = join_path(mountpoint, path.trim_start_matches('/'));
             assert!(Path::new(&path).exists(), "Cgroup {} does not exist", path);
         }
 
@@ -1237,11 +1244,7 @@ mod tests {
         let mut manager = new_manager();
         manager.create_cgroups().unwrap();
 
-        let cgroup_path = if manager.v2() {
-            manager.cgroup_path(None).unwrap()
-        } else {
-            manager.cgroup_path(Some("memory")).unwrap()
-        };
+        let cgroup_path = managed_cgroup_path(&manager, (!manager.v2()).then_some("memory"));
         assert!(
             Path::new(&cgroup_path).exists(),
             "Cgroup should exist before destroy"
@@ -1380,7 +1383,6 @@ mod tests {
 
     #[test]
     fn test_enable_cpus_topdown() {
-        let cpuset_cpus_path = format!("/sys/fs/cgroup/{}/cpuset.cpus", TEST_BASE);
         let online_cpus = fs::read_to_string("/sys/devices/system/cpu/online").unwrap();
         let cpus = parse_cpu_list(&online_cpus);
 
@@ -1398,6 +1400,8 @@ mod tests {
             .build()
             .unwrap();
         run_set_resources(linux_resources, |manager| {
+            let managed_path = managed_cgroup_path(manager, (!manager.v2()).then_some("cpuset"));
+            let cpuset_cpus_path = join_path(&managed_path, "cpuset.cpus");
             let cpus1 = fs::read_to_string(&cpuset_cpus_path).unwrap();
             let cpus1 = parse_cpu_list(&cpus1);
             assert_eq!(cpus[..1], cpus1);
