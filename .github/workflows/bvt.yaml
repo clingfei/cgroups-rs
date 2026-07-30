@@ -7,7 +7,7 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: make debug
 
@@ -15,7 +15,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: rustup component add rustfmt
       - run: make fmt
@@ -23,15 +23,117 @@ jobs:
     name: Clippy Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
       - run: rustup component add clippy
       - run: make clippy
   test:
-    name: Run Unit Test
-    runs-on: ubuntu-latest
+    name: Unit and Integration Test / ${{ matrix.hierarchy }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - hierarchy: v1
+            unexpected_skip: Skipping test in cgroups v2 mode
+          - hierarchy: v2
+            unexpected_skip: Skipping test in cgroups v1 mode
+    env:
+      CGROUP_HIERARCHY: ${{ matrix.hierarchy }}
+      CGROUP_IMAGE_NAME: ubuntu-22.04-server-cloudimg-amd64.img
+      CGROUP_IMAGE_SHA256: 757908b2fd6d5b1431bb45070fc1f56cbf017d4025568d292ece37d9cc75e812
+      CGROUP_IMAGE_URL: https://cloud-images.ubuntu.com/releases/jammy/release-20260722/ubuntu-22.04-server-cloudimg-amd64.img
+      UNEXPECTED_SKIP: ${{ matrix.unexpected_skip }}
+      QEMU_ACCEL: tcg
     steps:
-      - uses: actions/checkout@v2
-      - run: rustup install ${{ env.RUST_VERSION }} && rustup default ${{ env.RUST_VERSION }}
-      - run: make test
+      - uses: actions/checkout@v6
 
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install QEMU and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            cloud-image-utils \
+            jq \
+            musl-tools \
+            ovmf \
+            qemu-system-x86 \
+            qemu-utils
+
+      - name: Restore pinned Ubuntu cloud image
+        id: image-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/cgroup-image
+          key: ubuntu-jammy-20260722-amd64
+
+      - name: Download Ubuntu cloud image
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cgroup-image"
+          curl --fail --location --retry 3 \
+            --output "${RUNNER_TEMP}/cgroup-image/${CGROUP_IMAGE_NAME}" \
+            "${CGROUP_IMAGE_URL}"
+
+      - name: Verify Ubuntu cloud image
+        run: |
+          echo "${CGROUP_IMAGE_SHA256}  ${RUNNER_TEMP}/cgroup-image/${CGROUP_IMAGE_NAME}" \
+            | sha256sum --check -
+
+      - name: Build static test executables
+        run: |
+          ci/qemu/build-static-test-binaries.sh \
+            "${RUNNER_TEMP}/cgroup-test-binaries"
+
+      - name: Create guest SSH key
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cgroup-ssh"
+          ssh-keygen \
+            -q \
+            -t ed25519 \
+            -N "" \
+            -f "${RUNNER_TEMP}/cgroup-ssh/id_ed25519"
+
+      - name: Start cgroup ${{ matrix.hierarchy }} guest
+        run: |
+          ci/qemu/boot-cgroup-test-vm.sh \
+            "${RUNNER_TEMP}/cgroup-vm" \
+            "${RUNNER_TEMP}/cgroup-image/${CGROUP_IMAGE_NAME}" \
+            "${RUNNER_TEMP}/cgroup-ssh/id_ed25519.pub" \
+            "${CGROUP_HIERARCHY}"
+
+      - name: Run cgroupfs and systemd tests
+        run: |
+          set -o pipefail
+          ci/qemu/run-tests-in-cgroup-vm.sh \
+            "${RUNNER_TEMP}/cgroup-vm" \
+            "${RUNNER_TEMP}/cgroup-test-binaries" \
+            "${RUNNER_TEMP}/cgroup-ssh/id_ed25519" \
+            "${CGROUP_HIERARCHY}" \
+            2>&1 | tee "${RUNNER_TEMP}/cgroup-tests.log"
+          if grep -q "${UNEXPECTED_SKIP}" \
+              "${RUNNER_TEMP}/cgroup-tests.log"; then
+            echo "A ${CGROUP_HIERARCHY} test unexpectedly skipped" >&2
+            exit 1
+          fi
+
+      - name: Upload QEMU diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cgroup-${{ matrix.hierarchy }}-qemu-diagnostics
+          path: |
+            ${{ runner.temp }}/cgroup-vm/console.log
+            ${{ runner.temp }}/cgroup-vm/qemu.log
+          if-no-files-found: ignore
+
+      - name: Stop cgroup guest
+        if: always()
+        run: ci/qemu/stop-cgroup-test-vm.sh "${RUNNER_TEMP}/cgroup-vm"
