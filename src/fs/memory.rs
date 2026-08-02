@@ -957,15 +957,19 @@ impl MemController {
     }
 
     pub fn disable_oom_killer(&self) -> Result<()> {
-        self.open_path("memory.oom_control", true)
-            .and_then(|mut file| {
-                file.write_all("1".to_string().as_ref()).map_err(|e| {
-                    Error::with_cause(
-                        WriteFailed("memory.oom_control".to_string(), "1".to_string()),
-                        e,
-                    )
+        if self.v2 {
+            Err(Error::new(CgroupVersion))
+        } else {
+            self.open_path("memory.oom_control", true)
+                .and_then(|mut file| {
+                    file.write_all("1".to_string().as_ref()).map_err(|e| {
+                        Error::with_cause(
+                            WriteFailed("memory.oom_control".to_string(), "1".to_string()),
+                            e,
+                        )
+                    })
                 })
-            })
+        }
     }
 
     pub fn register_oom_event(&self, key: &str) -> Result<Receiver<String>> {
@@ -1002,9 +1006,12 @@ impl<'a> From<&'a Subsystem> for &'a MemController {
 
 #[cfg(test)]
 mod tests {
+    use crate::fs::error::ErrorKind;
     use crate::fs::memory::{
-        parse_memory_stat, parse_numa_stat, parse_oom_control, MemoryStat, NumaStat, OomControl,
+        parse_memory_stat, parse_numa_stat, parse_oom_control, MemController, MemoryStat, NumaStat,
+        OomControl,
     };
+    use std::path::PathBuf;
 
     static GOOD_VALUE: &str = "\
 total=51189 N0=51189 N1=123
@@ -1214,6 +1221,21 @@ total_unevictable 81920
                 total_unevictable: 81920,
                 raw,
             }
+        );
+    }
+
+    #[test]
+    fn test_disable_oom_killer_v2() {
+        // memory.oom_control does not exist in cgroup v2, so this must fail
+        // cleanly instead of trying to write a non-existent file.
+        let c = MemController::new(
+            PathBuf::from("/sys/fs/cgroup/does-not-exist"),
+            PathBuf::from("/sys/fs/cgroup"),
+            true,
+        );
+        assert_eq!(
+            c.disable_oom_killer().unwrap_err().kind(),
+            &ErrorKind::CgroupVersion
         );
     }
 }

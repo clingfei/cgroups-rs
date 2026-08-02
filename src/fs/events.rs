@@ -4,9 +4,11 @@
 //
 
 use eventfd::{eventfd, EfdFlags};
+use nix::errno::Errno;
 use nix::sys::eventfd;
+use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
@@ -15,14 +17,81 @@ use std::thread;
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 
-// notify_on_oom returns channel on which you can expect event about OOM,
-// if process died without OOM this channel will be closed.
-pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
-    register_memory_event(key, dir, "memory.oom_control", "")
+fn read_oom_count(path: &Path) -> Result<u64> {
+    let file = File::open(path)
+        .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line =
+            line.map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
+
+        let mut parts = line.split_whitespace();
+        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+            if key == "oom" {
+                let count: u64 = value
+                    .parse::<u64>()
+                    .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
+                return Ok(count);
+            }
+        }
+    }
+    Err(Error::from_string("oom not found".to_string()))
 }
 
 // notify_on_oom returns channel on which you can expect event about OOM,
-// if process died without OOM this channel will be closed.
+// if cgroup was destroyed without OOM this channel will be closed.
+pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
+    let path = dir.join("memory.events");
+    let inotify = Inotify::init(InitFlags::IN_CLOEXEC)
+        .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
+    inotify
+        .add_watch(&path, AddWatchFlags::IN_MODIFY)
+        .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
+
+    // Establish the watch before taking the baseline so changes after the
+    // baseline read are guaranteed to have a queued inotify event.
+    let mut base = read_oom_count(&path)?;
+    let (sender, receiver) = mpsc::channel();
+    let key = key.to_string();
+
+    thread::spawn(move || loop {
+        let events = match inotify.read_events() {
+            Ok(events) => events,
+            Err(Errno::EINTR) => continue,
+            Err(_) => return,
+        };
+
+        for event in events {
+            if event
+                .mask
+                .intersects(AddWatchFlags::IN_IGNORED | AddWatchFlags::IN_UNMOUNT)
+            {
+                return;
+            }
+
+            if event
+                .mask
+                .intersects(AddWatchFlags::IN_MODIFY | AddWatchFlags::IN_Q_OVERFLOW)
+            {
+                let count = match read_oom_count(&path) {
+                    Ok(count) => count,
+                    Err(_) => return,
+                };
+
+                if count > base {
+                    if sender.send(key.clone()).is_err() {
+                        return;
+                    }
+                    base = count;
+                }
+            }
+        }
+    });
+    Ok(receiver)
+}
+
+// notify_on_oom returns channel on which you can expect event about OOM,
+// if cgroup was destroyed without OOM this channel will be closed.
 pub fn notify_on_oom_v1(key: &str, dir: &Path) -> Result<Receiver<String>> {
     register_memory_event(key, dir, "memory.oom_control", "")
 }
@@ -89,4 +158,98 @@ fn register_memory_event(
     });
 
     Ok(receiver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cgroups-rs-events-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_read_oom_count() {
+        let dir = test_dir();
+        let path = dir.join("memory.events");
+
+        // full format, including the newer sock_throttled line
+        fs::write(
+            &path,
+            "low 0\nhigh 0\nmax 0\noom 3\noom_kill 0\noom_group_kill 0\nsock_throttled 0\n",
+        )
+        .unwrap();
+        assert_eq!(read_oom_count(&path).unwrap(), 3);
+
+        // line order must not matter, and missing lines are fine (older kernels)
+        fs::write(&path, "oom 7\nlow 0\n").unwrap();
+        assert_eq!(read_oom_count(&path).unwrap(), 7);
+
+        // key absent -> error
+        fs::write(&path, "low 0\nhigh 0\n").unwrap();
+        assert!(read_oom_count(&path).is_err());
+
+        // file absent -> error
+        assert!(read_oom_count(&dir.join("nope")).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_notify_on_oom_v2() {
+        let dir = test_dir();
+        let events = dir.join("memory.events");
+        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 5\noom_kill 0\n").unwrap();
+
+        let rx = notify_on_oom_v2("test-key", &dir).unwrap();
+
+        // Pre-existing OOMs are the baseline, not notified.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        // A kill-count change without a new OOM must not notify.
+        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 5\noom_kill 1\n").unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        // One new OOM produces exactly one notification.
+        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 6\noom_kill 1\n").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "test-key");
+
+        // no duplicate flood while the count stays the same
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        // A second OOM is notified again.
+        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 7\noom_kill 1\n").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "test-key");
+
+        // Destroying the cgroup closes the channel.
+        fs::remove_dir_all(&dir).unwrap();
+        let closed = (0..20).any(|_| {
+            matches!(
+                rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        assert!(closed);
+    }
 }
