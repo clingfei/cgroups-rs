@@ -15,7 +15,7 @@ readme = "README.md"
 async-io = "2"
 futures-lite = "2"
 log = "0.4"
-nix = { version = "0.31", default-features = false, features = ["event", "fs", "process", "signal"] }
+nix = { version = "0.31", default-features = false, features = ["event", "fs", "process", "signal", "inotify"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"], optional = true }
 thiserror = "1"
