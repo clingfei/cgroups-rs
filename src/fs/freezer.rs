@@ -45,6 +45,10 @@ impl ControllerInternal for FreezerController {
         &self.base
     }
 
+    fn is_v2(&self) -> bool {
+        self.v2
+    }
+
     fn apply(&self, _res: &Resources) -> Result<()> {
         Ok(())
     }
@@ -130,5 +134,99 @@ impl FreezerController {
                 Err(e) => Err(Error::with_cause(ReadFailed(file_name.to_string()), e)),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cgroups-rs-freezer-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_v1_state() {
+        let dir = temp_dir("v1-state");
+        let c = FreezerController::new(dir.clone(), dir.clone(), false);
+        assert!(!c.is_v2());
+
+        std::fs::write(dir.join("freezer.state"), "THAWED").unwrap();
+        assert_eq!(c.state().unwrap(), FreezerState::Thawed);
+
+        std::fs::write(dir.join("freezer.state"), "FROZEN").unwrap();
+        assert_eq!(c.state().unwrap(), FreezerState::Frozen);
+
+        std::fs::write(dir.join("freezer.state"), "FREEZING").unwrap();
+        assert_eq!(c.state().unwrap(), FreezerState::Freezing);
+
+        std::fs::write(dir.join("freezer.state"), "BOGUS").unwrap();
+        assert_eq!(c.state().unwrap_err().kind(), &ErrorKind::ParseError);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_v1_freeze_thaw() {
+        let dir = temp_dir("v1-freeze-thaw");
+        let c = FreezerController::new(dir.clone(), dir.clone(), false);
+
+        c.freeze().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("freezer.state")).unwrap(),
+            "FROZEN"
+        );
+
+        c.thaw().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("freezer.state")).unwrap(),
+            "THAWED"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_v2_state() {
+        let dir = temp_dir("v2-state");
+        let c = FreezerController::new(dir.clone(), dir.clone(), true);
+        assert!(c.is_v2());
+
+        std::fs::write(dir.join("cgroup.freeze"), "0").unwrap();
+        assert_eq!(c.state().unwrap(), FreezerState::Thawed);
+
+        std::fs::write(dir.join("cgroup.freeze"), "1").unwrap();
+        assert_eq!(c.state().unwrap(), FreezerState::Frozen);
+
+        std::fs::write(dir.join("cgroup.freeze"), "2").unwrap();
+        assert_eq!(c.state().unwrap_err().kind(), &ErrorKind::ParseError);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_v2_freeze_thaw() {
+        let dir = temp_dir("v2-freeze-thaw");
+        let c = FreezerController::new(dir.clone(), dir.clone(), true);
+
+        c.freeze().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.freeze")).unwrap(),
+            "1"
+        );
+
+        c.thaw().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.freeze")).unwrap(),
+            "0"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
