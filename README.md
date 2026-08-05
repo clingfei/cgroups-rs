@@ -10,25 +10,27 @@ Native Rust library for managing Linux control groups. Supports both cgroups v1 
 
 ```rust
 use cgroups_rs::*;
-use cgroups_rs::cgroup_builder::*;
+use cgroups_rs::fs::cgroup_builder::*;
+use cgroups_rs::fs::*;
 
 // Acquire a handle for the cgroup hierarchy.
-let hier = cgroups_rs::hierarchies::auto();
+let hier = cgroups_rs::fs::hierarchies::auto();
 
 // Use the builder pattern (see the documentation to create the control group)
 //
 // This creates a control group named "example" in the V1 hierarchy.
-    let cg: Cgroup = CgroupBuilder::new("example")
+let cg: Cgroup = CgroupBuilder::new("example")
         .cpu()
         .shares(85)
         .done()
-        .build(hier);
+        .build(hier)
+        .expect("failed to build cgroup");
 
 // Now `cg` is a control group that gets 85% of the CPU time in relative to
 // other control groups.
 
 // Get a handle to the CPU controller.
-let cpus: &cgroups_rs::cpu::CpuController = cg.controller_of().unwrap();
+let cpus: &cgroups_rs::fs::cpu::CpuController = cg.controller_of().unwrap();
 cpus.add_task(&CgroupPid::from(1234u64));
 
 // [...]
