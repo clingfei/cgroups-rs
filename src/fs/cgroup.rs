@@ -509,21 +509,40 @@ impl Cgroup {
 
 pub const UNIFIED_MOUNTPOINT: &str = "/sys/fs/cgroup";
 
+/// The freezer is not a v2 controller but a core cgroup feature exposed
+/// through the `cgroup.freeze` file. It is reported as a controller so
+/// that the v1-style API can address it uniformly.
+const FREEZER_CONTROLLER: &str = "freezer";
+
 fn enable_controllers(controllers: &[String], path: &Path) {
     let f = path.join("cgroup.subtree_control");
     for c in controllers {
+        // The freezer cannot be enabled through cgroup.subtree_control:
+        // it is a core v2 feature and not a controller.
+        if c == FREEZER_CONTROLLER {
+            continue;
+        }
         let body = format!("+{}", c);
         let _rest = fs::write(f.as_path(), body.as_bytes());
     }
 }
 
+/// The controllers supported by the unified hierarchy, including the
+/// always-available freezer core functionality.
 fn supported_controllers() -> Vec<String> {
     let p = format!("{}/{}", UNIFIED_MOUNTPOINT, "cgroup.controllers");
     let ret = fs::read_to_string(p.as_str());
-    ret.unwrap_or_default()
+    let mut controllers: Vec<String> = ret
+        .unwrap_or_default()
         .split(' ')
         .map(|x| x.trim().to_string())
-        .collect::<Vec<String>>()
+        .filter(|x| !x.is_empty())
+        .collect();
+
+    if !controllers.iter().any(|x| x == FREEZER_CONTROLLER) {
+        controllers.push(FREEZER_CONTROLLER.to_string());
+    }
+    controllers
 }
 
 fn create_v2_cgroup(
