@@ -73,9 +73,27 @@ impl SystemdClient<'_> {
             self.props.iter().map(|(k, v)| (*k, v)).collect();
         let props_borrowed: Vec<&(&str, &Value)> = props_borrowed.iter().collect();
 
-        sys_proxy.start_transient_unit(&self.unit, UNIT_MODE_REPLACE, &props_borrowed, &[])?;
+        // StartTransientUnit only queues the start job. Install the signal
+        // listener first so a fast job cannot finish before we start waiting.
+        let mut job_removed = sys_proxy.receive_job_removed()?;
+        sys_proxy.subscribe()?;
 
-        Ok(())
+        let job =
+            sys_proxy.start_transient_unit(&self.unit, UNIT_MODE_REPLACE, &props_borrowed, &[])?;
+
+        for signal in &mut job_removed {
+            let args = signal.args()?;
+            if args.job.as_str() != job.as_str() {
+                continue;
+            }
+
+            return match args.result {
+                "done" => Ok(()),
+                result => Err(Error::JobFailed(result.to_string())),
+            };
+        }
+
+        Err(Error::JobRemovedSignalStreamClosed)
     }
 
     /// Stop the current transient unit, the processes will be killed on
@@ -242,7 +260,6 @@ pub mod tests {
 
         // Write the current process to the cgroup.
         cgroup.start().unwrap();
-        cgroup.add_process(pid, "/").unwrap();
         cgroup
     }
 
