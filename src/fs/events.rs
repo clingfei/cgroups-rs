@@ -3,11 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
-use eventfd::{eventfd, EfdFlags};
-use nix::sys::eventfd;
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::fs::{self, File};
-use std::io::Read;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -49,14 +47,14 @@ fn register_memory_event(
     let event_file = File::open(path.clone())
         .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
 
-    let eventfd = eventfd(0, EfdFlags::EFD_CLOEXEC)
+    let eventfd = EventFd::from_flags(EfdFlags::EFD_CLOEXEC)
         .map_err(|e| Error::with_cause(ReadFailed("eventfd".to_string()), e))?;
 
     let event_control_path = cg_dir.join("cgroup.event_control");
     let data = if arg.is_empty() {
-        format!("{} {}", eventfd, event_file.as_raw_fd())
+        format!("{} {}", eventfd.as_raw_fd(), event_file.as_raw_fd())
     } else {
-        format!("{} {} {}", eventfd, event_file.as_raw_fd(), arg)
+        format!("{} {} {}", eventfd.as_raw_fd(), event_file.as_raw_fd(), arg)
     };
 
     // write to file and set mode to 0700(FIXME)
@@ -67,15 +65,12 @@ fn register_memory_event(
         )
     })?;
 
-    let mut eventfd_file = unsafe { File::from_raw_fd(eventfd) };
-
     let (sender, receiver) = mpsc::channel();
     let key = key.to_string();
 
     thread::spawn(move || {
         loop {
-            let mut buf = [0; 8];
-            if eventfd_file.read(&mut buf).is_err() {
+            if eventfd.read().is_err() {
                 return;
             }
 
