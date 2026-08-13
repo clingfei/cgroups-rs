@@ -12,6 +12,8 @@ homepage = "https://github.com/kata-containers/cgroups-rs"
 readme = "README.md"
 
 [dependencies]
+async-io = "2"
+futures-lite = "2"
 log = "0.4"
 nix = { version = "0.25.0", default-features = false, features = ["event", "fs", "process"] }
 libc = "0.2"

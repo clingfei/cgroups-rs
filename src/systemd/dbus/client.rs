@@ -4,13 +4,21 @@
 // SPDX-License-Identifier: Apache-2.0 or MIT
 //
 
+use std::future::Future;
+use std::time::Duration;
+
+use async_io::Timer;
+use futures_lite::{future, StreamExt};
 use zbus::zvariant::Value;
 use zbus::{Error as ZbusError, Result as ZbusResult};
 
 use crate::systemd::dbus::error::{Error, Result};
 use crate::systemd::dbus::proxy::systemd_manager_proxy;
+use crate::systemd::dbus::systemd_manager_proxy::ManagerProxy as AsyncSystemManager;
 use crate::systemd::{Property, NO_SUCH_UNIT, PIDS, UNIT_MODE_REPLACE};
 use crate::CgroupPid;
+
+const START_JOB_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SystemdClient<'a> {
     /// The name of the systemd unit (slice or scope)
@@ -67,15 +75,50 @@ impl SystemdClient<'_> {
             return Err(Error::InvalidProperties);
         }
 
-        let sys_proxy = systemd_manager_proxy()?;
-
         let props_borrowed: Vec<(&str, &zbus::zvariant::Value)> =
             self.props.iter().map(|(k, v)| (*k, v)).collect();
         let props_borrowed: Vec<&(&str, &Value)> = props_borrowed.iter().collect();
 
-        sys_proxy.start_transient_unit(&self.unit, UNIT_MODE_REPLACE, &props_borrowed, &[])?;
+        async_io::block_on(async {
+            let connection = zbus::Connection::system().await?;
+            let sys_proxy = AsyncSystemManager::new(&connection).await?;
 
-        Ok(())
+            // StartTransientUnit only queues the start job. Install the signal
+            // listener first so a fast job cannot finish before we start waiting.
+            let mut job_removed = sys_proxy
+                .receive_job_removed_with_args(&[(2, self.unit.as_str())])
+                .await?;
+            sys_proxy.subscribe().await?;
+
+            let job = sys_proxy
+                .start_transient_unit(&self.unit, UNIT_MODE_REPLACE, &props_borrowed, &[])
+                .await?;
+            let job_path = job.as_str().to_string();
+            let expected_job_path = job_path.clone();
+
+            let wait_for_job = async move {
+                while let Some(signal) = job_removed.next().await {
+                    let args = signal.args()?;
+                    if args.job.as_str() != expected_job_path.as_str() {
+                        continue;
+                    }
+
+                    return match args.result {
+                        "done" => Ok(()),
+                        result => Err(Error::JobFailed(result.to_string())),
+                    };
+                }
+
+                Err(Error::JobRemovedSignalStreamClosed)
+            };
+            let timeout_error = Error::JobWaitTimedOut {
+                unit: self.unit.clone(),
+                job: job_path,
+                timeout: START_JOB_TIMEOUT,
+            };
+
+            with_timeout(wait_for_job, START_JOB_TIMEOUT, timeout_error).await
+        })
     }
 
     /// Stop the current transient unit, the processes will be killed on
@@ -167,6 +210,17 @@ impl SystemdClient<'_> {
     }
 }
 
+async fn with_timeout<T, F>(operation: F, timeout: Duration, timeout_error: Error) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    future::race(operation, async move {
+        Timer::after(timeout).await;
+        Err(timeout_error)
+    })
+    .await
+}
+
 fn ignore_no_such_unit<T>(result: ZbusResult<T>) -> ZbusResult<bool> {
     if let Err(ZbusError::MethodError(err_name, _, _)) = &result {
         if err_name.as_str() == NO_SUCH_UNIT {
@@ -198,12 +252,40 @@ pub mod tests {
 
     use crate::fs::hierarchies;
     use crate::systemd::dbus::client::*;
+    use crate::systemd::dbus::error::Error;
     use crate::systemd::props::PropertiesBuilder;
     use crate::systemd::utils::expand_slice;
     use crate::systemd::{DEFAULT_DESCRIPTION, DESCRIPTION, PIDS};
     use crate::tests::{spawn_sleep_inf, spawn_yes};
 
     const TEST_SLICE: &str = "cgroupsrs-test.slice";
+
+    #[test]
+    fn test_wait_timeout() {
+        let timeout = Duration::from_millis(10);
+        let result = async_io::block_on(with_timeout(
+            futures_lite::future::pending::<crate::systemd::dbus::error::Result<()>>(),
+            timeout,
+            Error::JobWaitTimedOut {
+                unit: "test.scope".to_string(),
+                job: "/org/freedesktop/systemd1/job/1".to_string(),
+                timeout,
+            },
+        ));
+
+        match result {
+            Err(Error::JobWaitTimedOut {
+                unit,
+                job,
+                timeout: actual_timeout,
+            }) => {
+                assert_eq!(unit, "test.scope");
+                assert_eq!(job, "/org/freedesktop/systemd1/job/1");
+                assert_eq!(actual_timeout, timeout);
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 
     fn test_unit() -> String {
         let rand_string: String = rand::thread_rng()
@@ -242,7 +324,6 @@ pub mod tests {
 
         // Write the current process to the cgroup.
         cgroup.start().unwrap();
-        cgroup.add_process(pid, "/").unwrap();
         cgroup
     }
 
