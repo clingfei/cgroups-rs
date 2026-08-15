@@ -41,17 +41,31 @@ fn read_oom_count(path: &Path) -> Result<u64> {
 // if cgroup was destroyed without OOM this channel will be closed.
 pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
     let path = dir.join("memory.events");
+    let parent = dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let cgroup_name = dir.file_name().ok_or_else(|| {
+        Error::from_string(format!("cannot watch cgroup removal for {}", dir.display()))
+    })?;
     let inotify = Inotify::init(InitFlags::IN_CLOEXEC)
         .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
-    inotify
+    let parent_watch = inotify
+        .add_watch(
+            parent,
+            AddWatchFlags::IN_DELETE | AddWatchFlags::IN_MOVED_FROM,
+        )
+        .map_err(|e| Error::with_cause(ReadFailed(parent.display().to_string()), e))?;
+    let events_watch = inotify
         .add_watch(&path, AddWatchFlags::IN_MODIFY)
         .map_err(|e| Error::with_cause(ReadFailed(path.display().to_string()), e))?;
 
-    // Establish the watch before taking the baseline so changes after the
-    // baseline read are guaranteed to have a queued inotify event.
+    // Establish both watches before taking the baseline so changes after the
+    // baseline read and removal during registration have queued events.
     let mut base = read_oom_count(&path)?;
     let (sender, receiver) = mpsc::channel();
     let key = key.to_string();
+    let cgroup_name = cgroup_name.to_os_string();
 
     thread::spawn(move || loop {
         let events = match inotify.read_events() {
@@ -61,6 +75,15 @@ pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
         };
 
         for event in events {
+            if event.wd == parent_watch
+                && event.name.as_deref() == Some(cgroup_name.as_os_str())
+                && event
+                    .mask
+                    .intersects(AddWatchFlags::IN_DELETE | AddWatchFlags::IN_MOVED_FROM)
+            {
+                return;
+            }
+
             if event
                 .mask
                 .intersects(AddWatchFlags::IN_IGNORED | AddWatchFlags::IN_UNMOUNT)
@@ -68,9 +91,10 @@ pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
                 return;
             }
 
-            if event
-                .mask
-                .intersects(AddWatchFlags::IN_MODIFY | AddWatchFlags::IN_Q_OVERFLOW)
+            if event.wd == events_watch
+                && event
+                    .mask
+                    .intersects(AddWatchFlags::IN_MODIFY | AddWatchFlags::IN_Q_OVERFLOW)
             {
                 let count = match read_oom_count(&path) {
                     Ok(count) => count,
@@ -247,5 +271,32 @@ mod tests {
             )
         });
         assert!(closed);
+    }
+
+    #[test]
+    fn test_notify_on_oom_v2_closes_when_cgroup_moves() {
+        let dir = test_dir();
+        let sibling_dir = dir.with_extension("sibling");
+        let moved_dir = dir.with_extension("moved");
+        let events = dir.join("memory.events");
+        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n").unwrap();
+
+        let rx = notify_on_oom_v2("test-key", &dir).unwrap();
+
+        fs::create_dir(&sibling_dir).unwrap();
+        fs::remove_dir(&sibling_dir).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        fs::rename(&dir, &moved_dir).unwrap();
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+
+        fs::remove_dir_all(&moved_dir).unwrap();
     }
 }
