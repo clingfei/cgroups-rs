@@ -66,6 +66,9 @@ pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
     let (sender, receiver) = mpsc::channel();
     let key = key.to_string();
     let cgroup_name = cgroup_name.to_os_string();
+    // Own the path so the watcher thread can re-check liveness after a queue
+    // overflow without borrowing from the caller ('static required by spawn).
+    let dir = dir.to_path_buf();
 
     thread::spawn(move || loop {
         let events = match inotify.read_events() {
@@ -75,6 +78,28 @@ pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
         };
 
         for event in events {
+            if event.mask.intersects(AddWatchFlags::IN_Q_OVERFLOW) {
+                // The queue overflowed and events (an OOM modification or a
+                // cgroup-removal event) may have been lost. Overflow events
+                // are reported with wd == -1, so resynchronize from the
+                // current state instead of filtering by watch descriptor.
+                if !dir.exists() {
+                    return;
+                }
+                let count = match read_oom_count(&path) {
+                    Ok(count) => count,
+                    Err(_) => return,
+                };
+
+                if count > base {
+                    if sender.send(key.clone()).is_err() {
+                        return;
+                    }
+                    base = count;
+                }
+                continue;
+            }
+
             if event.wd == parent_watch
                 && event.name.as_deref() == Some(cgroup_name.as_os_str())
                 && event
@@ -91,11 +116,7 @@ pub fn notify_on_oom_v2(key: &str, dir: &Path) -> Result<Receiver<String>> {
                 return;
             }
 
-            if event.wd == events_watch
-                && event
-                    .mask
-                    .intersects(AddWatchFlags::IN_MODIFY | AddWatchFlags::IN_Q_OVERFLOW)
-            {
+            if event.wd == events_watch && event.mask.intersects(AddWatchFlags::IN_MODIFY) {
                 let count = match read_oom_count(&path) {
                     Ok(count) => count,
                     Err(_) => return,
@@ -183,7 +204,8 @@ fn register_memory_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -198,6 +220,20 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // Overwrite a watched fixture in place. Truncating (fs::write) would
+    // itself emit an IN_MODIFY that the watcher may observe while the file
+    // is empty, failing read_oom_count and disconnecting the channel.
+    // The replacement must have the same length as the current contents.
+    fn write_no_trunc(path: &Path, contents: &str) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().len(), contents.len() as u64);
+        file.write_all(contents.as_bytes()).unwrap();
     }
 
     #[test]
@@ -242,14 +278,14 @@ mod tests {
         );
 
         // A kill-count change without a new OOM must not notify.
-        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 5\noom_kill 1\n").unwrap();
+        write_no_trunc(&events, "low 0\nhigh 0\nmax 0\noom 5\noom_kill 1\n");
         assert_eq!(
             rx.recv_timeout(Duration::from_millis(200)),
             Err(mpsc::RecvTimeoutError::Timeout)
         );
 
         // One new OOM produces exactly one notification.
-        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 6\noom_kill 1\n").unwrap();
+        write_no_trunc(&events, "low 0\nhigh 0\nmax 0\noom 6\noom_kill 1\n");
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "test-key");
 
         // no duplicate flood while the count stays the same
@@ -259,7 +295,7 @@ mod tests {
         );
 
         // A second OOM is notified again.
-        fs::write(&events, "low 0\nhigh 0\nmax 0\noom 7\noom_kill 1\n").unwrap();
+        write_no_trunc(&events, "low 0\nhigh 0\nmax 0\noom 7\noom_kill 1\n");
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "test-key");
 
         // Destroying the cgroup closes the channel.
