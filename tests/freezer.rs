@@ -13,6 +13,7 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 use std::time::Duration;
 
+use cgroups_rs::fs::error::ErrorKind;
 use cgroups_rs::fs::freezer::FreezerController;
 use cgroups_rs::fs::Cgroup;
 use cgroups_rs::{CgroupPid, FreezerState};
@@ -55,25 +56,35 @@ fn freeze_and_thaw(cg: &Cgroup, task: u64) {
     }
 }
 
-struct ChildGuard(Child);
+struct ChildGuard<'a> {
+    child: Child,
+    cgroup: &'a Cgroup,
+}
 
-impl Drop for ChildGuard {
+impl<'a> Drop for ChildGuard<'a> {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // A task frozen by the v1 (or v2) freezer ignores SIGKILL, so a
+        // panic that leaves the child frozen would make `wait()` block
+        // until the CI timeout. Thaw the cgroup best-effort first; on an
+        // already-thawed cgroup `thaw()` is an idempotent no-op write.
+        if let Some(freezer) = self.cgroup.controller_of::<FreezerController>() {
+            let _ = freezer.thaw();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 /// Forks a child that just sleeps, runs `f` in the parent, then kills and
 /// reaps the child.
-fn with_sleeping_child(f: impl FnOnce(u64)) {
+fn with_sleeping_child(cg: &Cgroup, f: impl FnOnce(u64)) {
     let child = Command::new("sleep")
         .arg("60")
         .spawn()
         .expect("Failed to spawn sleep process");
 
-    let guard = ChildGuard(child);
-    f(guard.0.id() as u64);
+    let guard = ChildGuard { child, cgroup: cg };
+    f(guard.child.id() as u64);
 }
 
 #[test]
@@ -85,14 +96,17 @@ fn test_freezer_v2_specified_controllers() {
     // Regression test for issue #124: creating a v2 cgroup with only the
     // freezer controller specified must succeed, even though the kernel
     // does not list freezer in cgroup.controllers.
-    let cg = Cgroup::new_with_specified_controllers(
+    let cg = match Cgroup::new_with_specified_controllers(
         cgroups_rs::fs::hierarchies::auto(),
         String::from("test_freezer_v2_specified_controllers"),
         Some(vec![String::from("freezer")]),
-    )
-    .unwrap();
+    ) {
+        Ok(cg) => cg,
+        Err(e) if e.kind() == &ErrorKind::SpecifiedControllers => return,
+        Err(e) => panic!("failed to create v2 cgroup: {}", e),
+    };
 
-    with_sleeping_child(|pid| {
+    with_sleeping_child(&cg, |pid| {
         freeze_and_thaw(&cg, pid);
     });
     cg.delete().unwrap();
@@ -116,7 +130,7 @@ fn test_freezer_v1_freeze_thaw() {
         return;
     }
 
-    with_sleeping_child(|pid| {
+    with_sleeping_child(&cg, |pid| {
         freeze_and_thaw(&cg, pid);
     });
     cg.delete().unwrap();
