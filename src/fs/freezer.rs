@@ -8,13 +8,14 @@
 //!
 //! See the Kernel's documentation for more information about this subsystem, found at:
 //!  [Documentation/cgroup-v1/freezer-subsystem.txt](https://www.kernel.org/doc/Documentation/cgroup-v1/freezer-subsystem.txt)
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 
 use crate::fs::error::ErrorKind::*;
 use crate::fs::error::*;
 use crate::fs::{
-    read_u64_from, ControllIdentifier, ControllerInternal, Controllers, Resources, Subsystem,
+    read_keyed_u64, read_u64_from, ControllIdentifier, ControllerInternal, Controllers, Resources,
+    Subsystem,
 };
 use crate::FreezerState;
 
@@ -136,20 +137,8 @@ impl FreezerController {
     fn read_frozen_counter(&self, file_name: &str) -> Result<u64> {
         self.open_path(file_name, false).and_then(|file| {
             let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line =
-                    line.map_err(|e| Error::with_cause(ReadFailed(file_name.to_string()), e))?;
-
-                let mut parts = line.split_whitespace();
-                if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                    if key == "frozen" {
-                        return value
-                            .parse::<u64>()
-                            .map_err(|e| Error::with_cause(ParseError, e));
-                    }
-                }
-            }
-            Err(Error::new(ErrorKind::ParseError))
+            read_keyed_u64(reader, "frozen", file_name)?
+                .ok_or_else(|| Error::new(ErrorKind::ParseError))
         })
     }
 
